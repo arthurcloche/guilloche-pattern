@@ -75,6 +75,11 @@ uniform float contrast;
 uniform float blend;
 uniform bool useRGB;
 uniform bool useNoise;
+uniform bool useLevels;
+uniform float levelsAngle;
+uniform float levelsContrast;
+uniform float lineWidth;
+
 uniform vec3 colorA;
 uniform vec3 colorB;
 const vec3 color = vec3(0.05,0.1,-0.15);
@@ -82,7 +87,6 @@ const vec3 color = vec3(0.05,0.1,-0.15);
 #define RGB useRGB
 #define NOISE useNoise
 #define R resolution
-
 float luma(vec3 color) {
   return dot(color, vec3(0.299, 0.587, 0.114));
 }
@@ -110,43 +114,53 @@ float distort(vec2 nuv){
 
 float waves(float sampled) {
   vec2 pixel = floor(vec2(gl_FragCoord));
-  float w = dFdx(pixel.x/R.x);
   pixel *= rotate2d(angle);
-  float a = 1.0;
-  float b = mod(pixel.y + distort(pixel), spacing);
-  float c = spacing / 2.0;
-  if (b < spacing) a = abs(b - c) / c;
-  return balance(sampled, a, w);  
+  float phase = pixel.y + distort(pixel);
+  float c = spacing * 0.5;
+  float d = abs(mod(phase, spacing) - c);
+  float aa = fwidth(phase);
+  float halfWidth = max(0.25, lineWidth * 0.5); // pixels
+  float a = smoothstep(halfWidth - aa, halfWidth + aa, d);
+  return balance(sampled, a, aa);
+}
+
+float wavesWithAngle(float sampled, float angleParam) {
+  vec2 pixel = floor(vec2(gl_FragCoord));
+  pixel *= rotate2d(angleParam);
+  float phase = pixel.y + distort(pixel);
+  float c = spacing * 0.5;
+  float d = abs(mod(phase, spacing) - c);
+  float aa = fwidth(phase);
+  float halfWidth = max(0.25, lineWidth * 0.5); // pixels
+  float a = smoothstep(halfWidth - aa, halfWidth + aa, d);
+  return balance(sampled, a, aa);
 }
 
 void main(){
-
   vec2 uv = vertCoord;
-  /*
-    float a = angle/levels;
-    // diagonal waves
-    float result = 0.0;
-    for (float i = 0.0; i<levels; i++) {
-        // new uv coordinate
-        
-        vec2 nuv = rotate2d(a+a*i) * uv;
-        // calculate wave
-        float wave = distort(nuv);
-        float x = (spacing/2.0)+wave;
-        float y = mod(nuv.y,spacing);
-        // wave lines
-        float line = width * (1.0-(sampled*bright)-(i*dist));
-        float waves = smoothstep(line,line+alias,abs(x-y));
-        // save the result for the next wave
-        result += waves;
+  vec3 colored;
+  if (useLevels) {
+    int n = int(floor(levels + 0.5));
+    n = clamp(n, 1, 8);
+    float accum = 0.0;
+    for (int i = 0; i < 8; i++) {
+      if (i >= n) break;
+      float angle_i = angle + float(i) * (levelsAngle == 0. ? 0. : PI/levelsAngle);
+      float contrast_i = max(0.0001, contrast + float(i) * levelsContrast);
+      float sampled_i = pow(luma(texture(tex, uv).rgb), contrast_i);
+      float r_i = wavesWithAngle(sampled_i, angle_i);
+      accum += r_i;
     }
-    result /= levels;
-    result = smoothstep(blend,1.0,result);
-    */
-    float sampled = pow(luma(texture(tex,uv).rgb),contrast);  
+    float result = accum / float(n);
+    colored = mix(colorB, colorA, result);
+  } else {
+    float sampled = pow(luma(texture(tex,uv).rgb), contrast);
     float result = waves(sampled);
-    vec3 colored = mix(colorB,colorA,result);
-    fragColor = vec4(colored,1.0);
+    colored = mix(colorB, colorA, result);
+  }
+  fragColor = vec4(colored, 1.0);
+
+    
   
 }
   `;
@@ -161,7 +175,7 @@ let pos;
 const settings = {
   useLevels: false,
   useNoise: false,
-  needsUpdate: false,
+  needsUpdate: true,
   sliders: [],
   buttons: [],
 };
@@ -204,9 +218,9 @@ function setup() {
   settings.sliders = [
     {
       name: "angle",
-      val: Math.PI,
+      val: 0,
       min: 0,
-      max: Math.PI * 2,
+      max: Math.PI,
       step: 0.01,
       className: "",
     },
@@ -216,21 +230,29 @@ function setup() {
     { name: "bright", val: 4, min: 1, max: 8, step: 0.1, className: "" },
     { name: "contrast", val: 2, min: 1, max: 8, step: 0.01, className: "" },
     { name: "blend", val: 0.6, min: 0, max: 1, step: 0.01, className: "" },
+    {
+      name: "lineWidth",
+      val: 3.5,
+      min: 0.25,
+      max: 6,
+      step: 0.05,
+      className: "",
+    },
     { name: "levels", val: 3, min: 1, max: 4, step: 1, className: "multi" },
     {
       name: "levelsAngle",
-      val: 3,
-      min: 1,
+      val: 0,
+      min: 0,
       max: 4,
-      step: 1,
+      step: 0.5,
       className: "multi",
     },
     {
-      name: "levelsContrat",
-      val: 3,
+      name: "levelsContrast",
+      val: 2,
       min: 1,
-      max: 4,
-      step: 1,
+      max: 8,
+      step: 0.01,
       className: "multi",
     },
   ].map((slider) => {
@@ -319,6 +341,34 @@ const hexToVec3 = (h) => (
   [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16) / 255)
 );
 
+function fitCanvasToImage(img) {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const maxW = vw - 64;
+  const maxH = vh - 64;
+  const imgAR = img.width / img.height;
+  let newW, newH;
+  if (imgAR > 1) {
+    // wider than tall, fit horizontally
+    newW = maxW;
+    newH = newW / imgAR;
+    if (newH > maxH) {
+      newH = maxH;
+      newW = newH * imgAR;
+    }
+  } else {
+    // taller than wide, fit vertically
+    newH = maxH;
+    newW = newH * imgAR;
+    if (newW > maxW) {
+      newW = maxW;
+      newH = newW / imgAR;
+    }
+  }
+  resizeCanvas(Math.round(newW), Math.round(newH));
+  pg.resizeCanvas(Math.round(newW), Math.round(newH));
+}
+
 function draw() {
   background(220);
   noStroke();
@@ -327,20 +377,9 @@ function draw() {
   const my = constrain(mouseY, 0, height);
 
   if (settings.needsUpdate) {
+    fitCanvasToImage(img);
     pg.clear();
-    pg.image(
-      img,
-      0,
-      0,
-      width,
-      height,
-      0,
-      0,
-      img.width,
-      img.height,
-      COVER,
-      CENTER
-    );
+    pg.image(img, 0, 0, width, height);
     settings.needsUpdate = false;
   }
 
@@ -351,6 +390,7 @@ function draw() {
     resolution: [width, height],
     useRGB: settings.useRGB,
     useNoise: settings.useNoise,
+    useLevels: settings.useLevels,
   };
   settings.sliders.forEach((slider) => {
     const [name, el] = slider;
@@ -373,3 +413,7 @@ const createUniforms = (shader, config) => {
     shader.setUniform(uniform, config[uniform]);
   }
 };
+
+function windowResized() {
+  settings.needsUpdate = true;
+}
